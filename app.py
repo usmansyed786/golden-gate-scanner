@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from datetime import datetime
 
@@ -6,11 +7,36 @@ from core import (
     INDEX_URLS, TIMEFRAME_MAP, run_scan, run_multi_tf_scan,
     EMA_CONVERGENCE_PCT, PRICE_TO_EMA_PCT, BREAKOUT_LEVELS, GG_LOOKBACK_BARS,
 )
-from auth import is_valid_code, is_configured
 
 st.set_page_config(page_title="Golden Gate EMA Scanner", layout="wide")
 
-FREE_INDICES = ["NIFTY 50"]  # everything else requires a valid access code
+# ---------------------------------------------------------------------------
+# GOOGLE ADSENSE CONFIG
+# Fill these in once you're approved for AdSense (see README "Ads Setup").
+# Until then, leave as-is - the ad slots just won't render anything.
+# ---------------------------------------------------------------------------
+ADSENSE_CLIENT_ID = "ca-pub-XXXXXXXXXXXXXXXX"   # your AdSense publisher ID
+ADSENSE_SLOT_TOP = "XXXXXXXXXX"                 # ad unit/slot ID for the top banner
+ADSENSE_SLOT_BOTTOM = "XXXXXXXXXX"              # ad unit/slot ID for the bottom banner
+ADS_ENABLED = "XXXX" not in ADSENSE_CLIENT_ID   # auto-disables until you fill in real IDs
+
+
+def render_ad(slot_id, height=100):
+    if not ADS_ENABLED:
+        return
+    components.html(
+        f"""
+        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADSENSE_CLIENT_ID}" crossorigin="anonymous"></script>
+        <ins class="adsbygoogle"
+             style="display:block"
+             data-ad-client="{ADSENSE_CLIENT_ID}"
+             data-ad-slot="{slot_id}"
+             data-ad-format="auto"
+             data-full-width-responsive="true"></ins>
+        <script>(adsbygoogle = window.adsbygoogle || []).push({{}});</script>
+        """,
+        height=height,
+    )
 
 st.title("🟡 Golden Gate EMA Scanner")
 st.caption("A technical-analysis screening tool for EMA 20/50/100/200 convergence and breakout patterns on NSE stocks.")
@@ -24,32 +50,11 @@ st.warning(
     icon="⚠️",
 )
 
-if "unlocked" not in st.session_state:
-    st.session_state.unlocked = False
+render_ad(ADSENSE_SLOT_TOP, height=100)
 
 with st.sidebar:
     st.header("Scan Settings")
     index_name = st.selectbox("Index", list(INDEX_URLS.keys()))
-
-    is_free_index = index_name in FREE_INDICES
-    locked = (not is_free_index) and (not st.session_state.unlocked)
-
-    if locked:
-        st.info(f"🔒 {index_name} is part of the paid tier. Nifty 50 is free.")
-        with st.expander("Have an access code?", expanded=True):
-            code_input = st.text_input("Enter access code", type="password")
-            if st.button("Unlock", use_container_width=True):
-                if is_valid_code(code_input):
-                    st.session_state.unlocked = True
-                    st.success("Unlocked! You can now scan any index.")
-                    st.rerun()
-                else:
-                    st.error("Invalid or unrecognized code.")
-        if not is_configured():
-            st.caption(
-                "(Note to app owner: access-code checking isn't configured yet - "
-                "see README 'Monetization Setup'.)"
-            )
 
     timeframe_labels = st.multiselect(
         "Timeframe(s) - choose 1 to 3",
@@ -95,7 +100,7 @@ with st.sidebar:
 
     run_button = st.button(
         "🔍 Run Scan", type="primary", use_container_width=True,
-        disabled=locked or len(timeframe_labels) == 0,
+        disabled=len(timeframe_labels) == 0,
     )
 
 
@@ -141,7 +146,7 @@ if "results_df" not in st.session_state:
     st.session_state.results_df = None
     st.session_state.last_scan_info = None
 
-if run_button and not locked and len(timeframe_labels) > 0:
+if run_button and len(timeframe_labels) > 0:
     progress_bar = st.progress(0, text="Fetching index constituents...")
     status_text = st.empty()
     tf_display = " + ".join(timeframe_labels)
@@ -276,6 +281,8 @@ else:
     st.info("Choose an index and 1-3 timeframes in the sidebar, then click **Run Scan**.")
 
 st.divider()
+render_ad(ADSENSE_SLOT_BOTTOM, height=100)
+
 st.caption(
     "Disclaimer: this tool performs purely mechanical EMA calculations on public "
     "market data. It is provided for educational and informational purposes only "

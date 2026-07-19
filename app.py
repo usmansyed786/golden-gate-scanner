@@ -113,7 +113,11 @@ def style_gg(dataframe):
                 return "color: #888888"
         return ""
     subset = [c for c in dataframe.columns if c.startswith("Golden Gate") or c.startswith("EMA Breakout Signal")]
-    return dataframe.style.applymap(color_cell, subset=subset)
+    styler = dataframe.style
+    # pandas >= 2.1 renamed Styler.applymap() to Styler.map(); support both
+    if hasattr(styler, "map"):
+        return styler.map(color_cell, subset=subset)
+    return styler.applymap(color_cell, subset=subset)
 
 
 def dhan_watchlist_button(dataframe, key_suffix, label="⬇️ Download for Dhan Watchlist Import"):

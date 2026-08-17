@@ -125,9 +125,9 @@ NSE_HEADERS = {
 
 
 def get_index_symbols(url, max_retries=3):
-    """Download the official NSE constituent list for an index.
-    Retries with a fresh session/backoff since NSE occasionally 503s bot-like
-    traffic, especially from cloud/datacenter IPs."""
+    """Download the official NSE constituent list for an index from the
+    static archive CSV. Retries with a fresh session/backoff since NSE
+    occasionally 403/503s bot-like traffic, especially from cloud/datacenter IPs."""
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -144,12 +144,57 @@ def get_index_symbols(url, max_retries=3):
             last_error = e
             if attempt < max_retries:
                 time.sleep(2 * attempt)
-    raise RuntimeError(
-        f"Could not fetch index list from NSE after {max_retries} attempts ({last_error}). "
-        "NSE sometimes blocks automated/cloud-hosted requests (503) even with correct URLs and "
-        "headers. This is more likely to happen when the app runs on a cloud server (e.g. "
-        "Streamlit Cloud) than on your own PC in India. See the README for a fallback option."
-    )
+    raise RuntimeError(str(last_error))
+
+
+def get_index_symbols_via_api(index_display_name, max_retries=2):
+    """Fallback fetch method: NSE's own live JSON API (the one their website
+    uses internally), which sometimes gets through even when the static
+    archive CSV endpoint is blocked. index_display_name must match NSE's
+    naming exactly, e.g. 'NIFTY 500', 'NIFTY MIDCAP 100'."""
+    import urllib.parse
+    url = f"https://www.nseindia.com/api/equity-stockIndices?index={urllib.parse.quote(index_display_name)}"
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            session = requests.Session()
+            session.headers.update(NSE_HEADERS)
+            session.get("https://www.nseindia.com", timeout=10)
+            time.sleep(1)
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+            rows = payload.get("data", [])
+            symbols = [
+                str(row["symbol"]).strip() for row in rows
+                if "symbol" in row and str(row["symbol"]).strip().upper() != index_display_name.upper()
+            ]
+            if not symbols:
+                raise RuntimeError("API returned no constituent symbols")
+            return [f"{s}.NS" for s in symbols]
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+    raise RuntimeError(str(last_error))
+
+
+def fetch_nse_index_symbols(market_name, url, max_retries=3):
+    """Tries the static archive CSV first, then the live JSON API, before
+    giving up. Returns tickers, or raises RuntimeError with both errors
+    described if neither source works."""
+    try:
+        return get_index_symbols(url, max_retries=max_retries)
+    except Exception as csv_error:
+        try:
+            return get_index_symbols_via_api(market_name)
+        except Exception as api_error:
+            raise RuntimeError(
+                f"Could not fetch {market_name} list from NSE via either the archive CSV "
+                f"({csv_error}) or the live API ({api_error}). NSE is likely blocking this "
+                "server's requests entirely. This is more likely on a cloud host (e.g. Streamlit "
+                "Cloud) than on your own PC in India. See the README for the upload fallback option."
+            )
 
 
 def get_tickers_for_market(market_name):
@@ -162,7 +207,7 @@ def get_tickers_for_market(market_name):
         return list(STATIC_MARKETS[market_name])
     if market_name in INDEX_URLS:
         try:
-            return get_index_symbols(INDEX_URLS[market_name])
+            return fetch_nse_index_symbols(market_name, INDEX_URLS[market_name])
         except Exception as e:
             if market_name in FALLBACK_INDEX_LISTS:
                 warnings.warn(f"{FALLBACK_LIST_NOTE} (Live fetch error: {e})")

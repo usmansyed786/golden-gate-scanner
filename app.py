@@ -1,42 +1,14 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
+import warnings
 from datetime import datetime
 
 from core import (
-    INDEX_URLS, TIMEFRAME_MAP, run_scan, run_multi_tf_scan,
-    EMA_CONVERGENCE_PCT, PRICE_TO_EMA_PCT, BREAKOUT_LEVELS, GG_LOOKBACK_BARS,
+    INDEX_URLS, STATIC_MARKETS, ALL_MARKETS, TIMEFRAME_MAP, run_scan, run_multi_timeframe_scan,
+    EMA_CONVERGENCE_PCT, PRICE_TO_EMA_PCT, BREAKOUT_LEVELS, GG_LOOKBACK_BARS, VOLUME_SPIKE_MULTIPLIER,
 )
 
 st.set_page_config(page_title="Golden Gate EMA Scanner", layout="wide")
-
-# ---------------------------------------------------------------------------
-# GOOGLE ADSENSE CONFIG
-# Fill these in once you're approved for AdSense (see README "Ads Setup").
-# Until then, leave as-is - the ad slots just won't render anything.
-# ---------------------------------------------------------------------------
-ADSENSE_CLIENT_ID = "ca-pub-XXXXXXXXXXXXXXXX"   # your AdSense publisher ID
-ADSENSE_SLOT_TOP = "XXXXXXXXXX"                 # ad unit/slot ID for the top banner
-ADSENSE_SLOT_BOTTOM = "XXXXXXXXXX"              # ad unit/slot ID for the bottom banner
-ADS_ENABLED = "XXXX" not in ADSENSE_CLIENT_ID   # auto-disables until you fill in real IDs
-
-
-def render_ad(slot_id, height=100):
-    if not ADS_ENABLED:
-        return
-    components.html(
-        f"""
-        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADSENSE_CLIENT_ID}" crossorigin="anonymous"></script>
-        <ins class="adsbygoogle"
-             style="display:block"
-             data-ad-client="{ADSENSE_CLIENT_ID}"
-             data-ad-slot="{slot_id}"
-             data-ad-format="auto"
-             data-full-width-responsive="true"></ins>
-        <script>(adsbygoogle = window.adsbygoogle || []).push({{}});</script>
-        """,
-        height=height,
-    )
 
 st.title("🟡 Golden Gate EMA Scanner")
 st.caption("A technical-analysis screening tool for EMA 20/50/100/200 convergence and breakout patterns on NSE stocks.")
@@ -50,11 +22,13 @@ st.warning(
     icon="⚠️",
 )
 
-render_ad(ADSENSE_SLOT_TOP, height=100)
-
 with st.sidebar:
     st.header("Scan Settings")
-    index_name = st.selectbox("Index", list(INDEX_URLS.keys()))
+    index_name = st.selectbox(
+        "Market / Index",
+        ALL_MARKETS,
+        help="NSE stock indices, plus Crypto and Commodities baskets.",
+    )
 
     timeframe_labels = st.multiselect(
         "Timeframe(s) - choose 1 to 3",
@@ -79,6 +53,10 @@ with st.sidebar:
             "Breakout levels to flag as EMA Breakout Signal (%)",
             [3, 5, 8, 10, 15, 20, 25],
             default=BREAKOUT_LEVELS,
+        )
+        volume_spike_mult = st.slider(
+            "Volume Spike threshold (x average volume)", 1.1, 5.0, VOLUME_SPIKE_MULTIPLIER, 0.1,
+            help="Latest bar's volume must be at least this many times the average of the prior 20 bars to be flagged as a spike.",
         )
 
     custom_tickers = None
@@ -105,41 +83,30 @@ with st.sidebar:
 
 
 def style_gg(dataframe):
-    """Color-codes any Golden Gate / EMA Breakout Signal column (including
-    per-timeframe ones like 'Golden Gate (Daily)'): green for Formed, red for
-    Not Formed, grey for No Data."""
+    """Color-codes Golden Gate / EMA Breakout Signal / Trend / Price Action /
+    Volume Spike columns (including per-timeframe ones like 'Trend (Daily)'):
+    green for bullish/positive states, red for bearish/negative, grey for
+    neutral/no-data."""
     def color_cell(val):
-        if isinstance(val, str):
-            if val.startswith("Formed"):
-                return "color: #0a7d2c; font-weight: 600"
-            if val == "Not Formed":
-                return "color: #c0392b"
-            if val == "No Data":
-                return "color: #888888"
+        if not isinstance(val, str):
+            return ""
+        v = val.strip()
+        if v.startswith("Formed") or v == "Uptrend" or v.startswith("Bullish") or v == "Yes":
+            return "color: #0a7d2c; font-weight: 600"
+        if v == "Not Formed" or v == "Downtrend" or v.startswith("Bearish"):
+            return "color: #c0392b"
+        if v in ("Mixed", "No", "Unknown"):
+            return "color: #888888"
+        if v in ("No Data",):
+            return "color: #888888; font-style: italic"
         return ""
-    subset = [c for c in dataframe.columns if c.startswith("Golden Gate") or c.startswith("EMA Breakout Signal")]
+
+    prefixes = ("Golden Gate", "EMA Breakout Signal", "Trend", "Price Action", "Volume Spike")
+    subset = [c for c in dataframe.columns if c.startswith(prefixes)]
     styler = dataframe.style
-    # pandas >= 2.1 renamed Styler.applymap() to Styler.map(); support both
-    if hasattr(styler, "map"):
+    if hasattr(styler, "map"):  # pandas >= 2.1 renamed applymap -> map
         return styler.map(color_cell, subset=subset)
     return styler.applymap(color_cell, subset=subset)
-
-
-def dhan_watchlist_button(dataframe, key_suffix, label="⬇️ Download for Dhan Watchlist Import"):
-    """Builds a .txt file of NSE:SYMBOL entries, one per line, matching the format
-    Dhan's charting platform (tv.dhan.co) accepts under Import to Watchlist."""
-    if dataframe is None or dataframe.empty or "Symbol" not in dataframe.columns:
-        return
-    symbols = [f"NSE:{s}" for s in dataframe["Symbol"].tolist()]
-    content = "\n".join(symbols)
-    st.download_button(
-        label,
-        data=content.encode("utf-8"),
-        file_name=f"dhan_watchlist_{key_suffix}.txt",
-        mime="text/plain",
-        key=f"dhan_dl_{key_suffix}",
-        help="Upload this file at tv.dhan.co -> User Settings -> Charts -> Import to Watchlist",
-    )
 
 
 if "results_df" not in st.session_state:
@@ -157,7 +124,8 @@ if run_button and len(timeframe_labels) > 0:
         progress_bar.progress(i / total, text=f"Scanning {index_name} ({tf_display})... {i}/{total}")
 
     try:
-        with st.spinner("Running scan..."):
+        with st.spinner("Running scan..."), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             if len(timeframe_labels) == 1:
                 df = run_scan(
                     index_name,
@@ -168,9 +136,10 @@ if run_button and len(timeframe_labels) > 0:
                     price_to_ema_pct=price_pct,
                     breakout_levels=breakout_levels,
                     gg_lookback_bars=lookback,
+                    volume_spike_multiplier=volume_spike_mult,
                 )
             else:
-                df = run_multi_tf_scan(
+                df = run_multi_timeframe_scan(
                     index_name,
                     timeframe_labels,
                     progress_callback=update_progress,
@@ -179,7 +148,10 @@ if run_button and len(timeframe_labels) > 0:
                     price_to_ema_pct=price_pct,
                     breakout_levels=breakout_levels,
                     gg_lookback_bars=lookback,
+                    volume_spike_multiplier=volume_spike_mult,
                 )
+        for w in caught:
+            st.info(f"ℹ️ {w.message}")
         st.session_state.results_df = df
         st.session_state.last_scan_info = {
             "index": index_name if not custom_tickers else "Custom uploaded list",
@@ -227,13 +199,11 @@ if df is not None and not df.empty:
             gg_any = df[df["Golden Gate - Any TF"] == "Formed"]
             st.metric("Stocks with Golden Gate formed on at least one selected timeframe", len(gg_any))
             st.dataframe(style_gg(gg_any[display_cols]), use_container_width=True, height=450)
-            dhan_watchlist_button(gg_any, "golden_gate_any_tf")
 
         with tab3:
             event_any = df[df["EMA Breakout Signal - Any TF"] == "Formed"]
             st.metric("Stocks with EMA Breakout Signal on at least one selected timeframe", len(event_any))
             st.dataframe(style_gg(event_any[display_cols]), use_container_width=True, height=450)
-            dhan_watchlist_button(event_any, "breakout_any_tf")
 
     else:
         tab1, tab2, tab3, tab4 = st.tabs(
@@ -247,13 +217,11 @@ if df is not None and not df.empty:
             gg_now = df[df["Golden Gate"] == "Formed"]
             st.metric("Stocks with Golden Gate formed", len(gg_now))
             st.dataframe(style_gg(gg_now), use_container_width=True, height=400)
-            dhan_watchlist_button(gg_now, "golden_gate")
 
         with tab3:
             gg_event = df[df["EMA Breakout Signal"].str.startswith("Formed")]
             st.metric("Stocks with EMA Breakout Signal", len(gg_event))
             st.dataframe(style_gg(gg_event), use_container_width=True, height=400)
-            dhan_watchlist_button(gg_event, "breakout_signal")
 
         with tab4:
             st.caption(
@@ -281,8 +249,6 @@ else:
     st.info("Choose an index and 1-3 timeframes in the sidebar, then click **Run Scan**.")
 
 st.divider()
-render_ad(ADSENSE_SLOT_BOTTOM, height=100)
-
 st.caption(
     "Disclaimer: this tool performs purely mechanical EMA calculations on public "
     "market data. It is provided for educational and informational purposes only "

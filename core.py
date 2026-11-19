@@ -314,9 +314,15 @@ def fetch_ishares_symbols(url):
     resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
     resp.raise_for_status()
     lines = resp.text.lstrip("\ufeff").splitlines()
-    start = next((i for i, ln in enumerate(lines) if ln.startswith("Ticker,")), None)
+    start = next(
+        (i for i, ln in enumerate(lines) if ln.replace('"', "").strip().startswith("Ticker,")), None
+    )
     if start is None:
-        raise RuntimeError("Holdings file format not recognised")
+        preview = " ".join(resp.text[:120].split())
+        raise RuntimeError(
+            f"Holdings file format not recognised (HTTP {resp.status_code}, "
+            f"content-type {resp.headers.get('Content-Type', '?')}, starts with: {preview!r})"
+        )
     df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
     if "Asset Class" in df.columns:
         df = df[df["Asset Class"].astype(str).str.strip() == "Equity"]

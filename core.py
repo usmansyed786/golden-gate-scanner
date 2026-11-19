@@ -7,6 +7,7 @@ import io
 import time
 import urllib.parse
 import warnings
+from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -346,7 +347,19 @@ def fetch_ishares_symbols(url):
             errors.append(f"{label}: {e} {preview!r}".strip())
             return None
 
-    # 1) plain request with the default python-requests identity
+    # 1) dated requests: the file endpoint is reliably served when an asOfDate
+    #    (a recent business day) is supplied. Try the last few weekdays.
+    days, d = [], date.today()
+    while len(days) < 6:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            days.append(d.strftime("%Y%m%d"))
+    for as_of in days:
+        out = attempt(f"asOf {as_of}", lambda as_of=as_of: requests.get(f"{url}&asOfDate={as_of}", timeout=30))
+        if out:
+            return out
+
+    # 1b) plain request with no date
     out = attempt("plain", lambda: requests.get(url, timeout=30))
     if out:
         return out
@@ -363,7 +376,7 @@ def fetch_ishares_symbols(url):
     if out:
         return out
 
-    raise RuntimeError("; ".join(errors))
+    raise RuntimeError(f"{len(errors)} attempts all returned a web page, not a CSV. Last: {errors[-1]}")
 
 
 def get_tickers_for_market(market_name, exchange="NSE"):

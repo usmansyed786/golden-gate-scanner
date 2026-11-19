@@ -308,21 +308,15 @@ def fetch_us_symbols(url):
     raise RuntimeError("No constituent table found on the page")
 
 
-def fetch_ishares_symbols(url):
-    """Reads an iShares ETF holdings CSV (a few preamble lines, then a header
-    row starting with 'Ticker') and returns the equity tickers, Yahoo style."""
-    resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
-    resp.raise_for_status()
-    lines = resp.text.lstrip("\ufeff").splitlines()
+def _parse_ishares_csv(text):
+    """iShares holdings CSV: a few preamble lines, then a (quoted) header row
+    starting with Ticker. Returns equity tickers, Yahoo style."""
+    lines = text.lstrip("\ufeff").splitlines()
     start = next(
         (i for i, ln in enumerate(lines) if ln.replace('"', "").strip().startswith("Ticker,")), None
     )
     if start is None:
-        preview = " ".join(resp.text[:120].split())
-        raise RuntimeError(
-            f"Holdings file format not recognised (HTTP {resp.status_code}, "
-            f"content-type {resp.headers.get('Content-Type', '?')}, starts with: {preview!r})"
-        )
+        raise RuntimeError("no Ticker header row (response was not a holdings CSV)")
     df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
     if "Asset Class" in df.columns:
         df = df[df["Asset Class"].astype(str).str.strip() == "Equity"]
@@ -330,8 +324,46 @@ def fetch_ishares_symbols(url):
     symbols = [x for x in s if x and x not in ("-", "nan") and x.replace("-", "").isalnum()]
     symbols = list(dict.fromkeys(symbols))
     if len(symbols) < 500:
-        raise RuntimeError("Holdings file returned too few symbols")
+        raise RuntimeError("holdings file returned too few symbols")
     return symbols
+
+
+def fetch_ishares_symbols(url):
+    """Downloads an iShares holdings CSV. iShares sometimes answers with an HTML
+    entry page instead of the file, so several request styles are tried."""
+    product_page = url.split("/1467271812596.ajax")[0]
+    errors = []
+
+    def attempt(label, getter):
+        try:
+            resp = getter()
+            resp.raise_for_status()
+            return _parse_ishares_csv(resp.text)
+        except Exception as e:
+            preview = ""
+            if "resp" in locals():
+                preview = " ".join(getattr(resp, "text", "")[:60].split())
+            errors.append(f"{label}: {e} {preview!r}".strip())
+            return None
+
+    # 1) plain request with the default python-requests identity
+    out = attempt("plain", lambda: requests.get(url, timeout=30))
+    if out:
+        return out
+
+    # 2) browser-like session: visit the fund page first to pick up cookies
+    def with_cookies():
+        s = requests.Session()
+        s.headers.update(WIKI_HEADERS)
+        s.headers["Accept-Language"] = "en-US,en;q=0.9"
+        s.get(product_page, params={"switchLocale": "y", "siteEntryPassthru": "true"}, timeout=30)
+        return s.get(url, headers={"Referer": product_page, "Accept": "text/csv,*/*"}, timeout=30)
+
+    out = attempt("session", with_cookies)
+    if out:
+        return out
+
+    raise RuntimeError("; ".join(errors))
 
 
 def get_tickers_for_market(market_name, exchange="NSE"):

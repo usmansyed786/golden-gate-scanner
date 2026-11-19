@@ -4,6 +4,7 @@ Golden Gate EMA Scanner - core logic (shared by CLI script and web app)
 """
 
 import io
+import random
 import time
 import urllib.parse
 import warnings
@@ -27,7 +28,7 @@ GG_LOOKBACK_BARS = 50
 VOLUME_AVG_PERIOD = 20
 VOLUME_SPIKE_MULTIPLIER = 1.5
 
-MAX_WORKERS = 5                # parallel yfinance downloads (raise carefully - Yahoo rate-limits)
+MAX_WORKERS = 3                # parallel yfinance downloads (raise carefully - Yahoo rate-limits)
 
 NSE_ARCHIVE = "https://nsearchives.nseindia.com/content/indices/"
 
@@ -417,8 +418,29 @@ def display_symbol(ticker):
 
 # ----------------------------- price data & indicators -----------------------
 
-def fetch_price_data(ticker, interval, period, resample_to=None):
-    data = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+try:
+    from yfinance.exceptions import YFRateLimitError
+except Exception:  # older yfinance versions
+    class YFRateLimitError(Exception):
+        pass
+
+
+def _is_rate_limit(exc):
+    return isinstance(exc, YFRateLimitError) or "rate limit" in str(exc).lower() or "too many requests" in str(exc).lower()
+
+
+def fetch_price_data(ticker, interval, period, resample_to=None, retries=3):
+    """Downloads OHLCV data, retrying with backoff if Yahoo rate-limits us."""
+    data = None
+    for attempt in range(retries + 1):
+        try:
+            data = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+            break
+        except Exception as e:
+            if _is_rate_limit(e) and attempt < retries:
+                time.sleep(2 ** (attempt + 1) + random.random())
+                continue
+            raise
     if data is None or data.empty:
         return None
     data = data.dropna(how="all")
@@ -587,6 +609,15 @@ def add_liquidity_ranking(df):
     return df.drop(columns=["_avg_turnover"])
 
 
+def _warn_if_sparse(got, total):
+    if total and got < 0.8 * total:
+        warnings.warn(
+            f"Only {got} of {total} requests returned data. Yahoo Finance is probably "
+            "rate-limiting this server (common on shared cloud hosts). Wait a few minutes "
+            "and rescan, pick a smaller index, or run the app on your own PC."
+        )
+
+
 def _resolve_tickers(index_name, custom_tickers, exchange, custom_suffix):
     if custom_tickers:
         return build_custom_tickers(custom_tickers, custom_suffix)
@@ -617,6 +648,8 @@ def run_scan(index_name, timeframe_label, progress_callback=None, custom_tickers
                 results.append(res)
             if progress_callback:
                 progress_callback(done, len(tickers), display_symbol(futures[fut]), res)
+
+    _warn_if_sparse(len(results), len(tickers))
 
     if not results:
         return pd.DataFrame()
@@ -654,6 +687,8 @@ def run_multi_timeframe_scan(index_name, timeframe_labels, progress_callback=Non
             done += 1
             if progress_callback:
                 progress_callback(done, total, display_symbol(t), tf)
+
+    _warn_if_sparse(sum(1 for v in results.values() if v), total)
 
     rows = []
     for ticker in tickers:

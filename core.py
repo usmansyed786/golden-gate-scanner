@@ -153,6 +153,15 @@ MARKET_GROUPS["🇺🇸 US Indices"] = list(_US)
 for _name, _url in _US.items():
     MARKETS[_name] = {"kind": "us", "url": _url}
 
+# Russell 2000 has no free official constituent list, so we read the holdings
+# file of iShares' IWM ETF, which tracks it (~1,900-2,000 stocks).
+IWM_HOLDINGS_URL = (
+    "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+    "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+)
+MARKET_GROUPS["🇺🇸 US Indices"].append("RUSSELL 2000")
+MARKETS["RUSSELL 2000"] = {"kind": "ishares", "url": IWM_HOLDINGS_URL}
+
 for _group, _items in _STATIC.items():
     MARKET_GROUPS[_group] = list(_items)
     for _name, _tickers in _items.items():
@@ -299,6 +308,26 @@ def fetch_us_symbols(url):
     raise RuntimeError("No constituent table found on the page")
 
 
+def fetch_ishares_symbols(url):
+    """Reads an iShares ETF holdings CSV (a few preamble lines, then a header
+    row starting with 'Ticker') and returns the equity tickers, Yahoo style."""
+    resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
+    resp.raise_for_status()
+    lines = resp.text.lstrip("\ufeff").splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("Ticker,")), None)
+    if start is None:
+        raise RuntimeError("Holdings file format not recognised")
+    df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+    if "Asset Class" in df.columns:
+        df = df[df["Asset Class"].astype(str).str.strip() == "Equity"]
+    s = df["Ticker"].astype(str).str.strip().str.replace(".", "-", regex=False)
+    symbols = [x for x in s if x and x not in ("-", "nan") and x.replace("-", "").isalnum()]
+    symbols = list(dict.fromkeys(symbols))
+    if len(symbols) < 500:
+        raise RuntimeError("Holdings file returned too few symbols")
+    return symbols
+
+
 def get_tickers_for_market(market_name, exchange="NSE"):
     """Returns a yfinance-ready ticker list. For NSE indices, exchange='BSE'
     maps every constituent to its BSE listing (.BO) instead of NSE (.NS)."""
@@ -312,6 +341,16 @@ def get_tickers_for_market(market_name, exchange="NSE"):
 
     if kind == "bse":
         return [f"{s}.BO" for s in spec["symbols"]]
+
+    if kind == "ishares":
+        try:
+            return fetch_ishares_symbols(spec["url"])
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not read the {market_name} holdings file ({e}). Download the IWM "
+                "holdings CSV from ishares.com and upload it via 'Use my own stock list' "
+                "(choose 'US / global')."
+            )
 
     if kind == "us":
         try:

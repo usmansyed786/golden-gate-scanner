@@ -1,5 +1,6 @@
 import io
 import warnings
+from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
@@ -8,7 +9,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from core import (
-    MARKET_GROUPS, TIMEFRAME_MAP, INTRADAY_INTERVALS, is_nse_market,
+    MARKET_GROUPS, TIMEFRAME_MAP, INTRADAY_INTERVALS, RUSSELL_FILE, is_nse_market,
     run_scan, run_multi_timeframe_scan, get_chart_data,
     EMA_CONVERGENCE_PCT, PRICE_TO_EMA_PCT, BREAKOUT_LEVELS, GG_LOOKBACK_BARS, VOLUME_SPIKE_MULTIPLIER,
 )
@@ -165,9 +166,11 @@ with st.sidebar:
         uploaded = st.file_uploader("or upload CSV", type=["csv"])
 
         symbols = [s for s in typed.replace("\n", ",").split(",") if s.strip()]
+        raw_upload = None
         if uploaded is not None:
             try:
-                lines = uploaded.getvalue().decode("utf-8-sig").splitlines()
+                raw_upload = uploaded.getvalue().decode("utf-8-sig")
+                lines = raw_upload.splitlines()
                 start = next(
                     (i for i, ln in enumerate(lines)
                      if ln.replace('"', "").strip().startswith(("Ticker,", "Symbol,"))), 0)
@@ -182,6 +185,14 @@ with st.sidebar:
         if symbols:
             custom_tickers = symbols
             st.success(f"{len(symbols)} symbols loaded. They will be scanned instead of the index above.")
+        if raw_upload and len(symbols) >= 500:
+            if st.button("Save as Russell 2000 list", help="Lets the RUSSELL 2000 index in the US group use this file."):
+                try:
+                    RUSSELL_FILE.parent.mkdir(exist_ok=True)
+                    RUSSELL_FILE.write_text(raw_upload, encoding="utf-8")
+                    st.success("Saved. Pick RUSSELL 2000 in the US group and clear the upload to scan it.")
+                except Exception as e:
+                    st.error(f"Couldn't save the file: {e}")
 
     run_button = st.button("Run scan", type="primary", width="stretch", disabled=not timeframe_labels)
 

@@ -272,12 +272,25 @@ def draw_chart(d, title, intraday):
 
 
 def chart_explorer(df, timeframes):
+    # Streamlit runs every tab on each refresh, so the chart only loads on request;
+    # otherwise every click would send a fresh request to Yahoo.
+    if not st.toggle("Load chart", key="chart_on", help="Fetches fresh price data for one symbol."):
+        st.caption("Turn on 'Load chart' to draw a candlestick chart with the four EMAs.")
+        return
     c1, c2 = st.columns([2, 1])
     symbol = c1.selectbox("Symbol", df["Symbol"].tolist(), key="chart_symbol")
     tf = c2.selectbox("Timeframe", timeframes, key="chart_tf")
     ticker = dict(zip(df["Symbol"], df["Ticker"]))[symbol]
-    with st.spinner("Loading chart..."):
-        data = load_chart(ticker, tf)
+    try:
+        with st.spinner("Loading chart..."):
+            data = load_chart(ticker, tf)
+    except Exception as e:
+        st.warning(
+            "Couldn't load this chart. Yahoo Finance is likely limiting requests from this "
+            "server right now, so wait a minute and try again. "
+            f"(Details: {type(e).__name__})"
+        )
+        return
     if data is None:
         st.info("No price data available for this symbol and timeframe.")
         return

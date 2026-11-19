@@ -7,7 +7,7 @@ import io
 import time
 import urllib.parse
 import warnings
-from datetime import date, timedelta
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -309,74 +309,39 @@ def fetch_us_symbols(url):
     raise RuntimeError("No constituent table found on the page")
 
 
-def _parse_ishares_csv(text):
-    """iShares holdings CSV: a few preamble lines, then a (quoted) header row
-    starting with Ticker. Returns equity tickers, Yahoo style."""
+RUSSELL_FILE = Path(__file__).parent / "data" / "russell2000.csv"
+
+
+def _parse_holdings_csv(text):
+    """Accepts an iShares holdings CSV (preamble lines, then a quoted header row
+    starting with Ticker) or a simple CSV with a Symbol/Ticker column.
+    Returns equity tickers, Yahoo style."""
     lines = text.lstrip("\ufeff").splitlines()
     start = next(
-        (i for i, ln in enumerate(lines) if ln.replace('"', "").strip().startswith("Ticker,")), None
+        (i for i, ln in enumerate(lines)
+         if ln.replace('"', "").strip().startswith(("Ticker", "Symbol"))), None
     )
     if start is None:
-        raise RuntimeError("no Ticker header row (response was not a holdings CSV)")
+        raise RuntimeError("no Ticker or Symbol header row found")
     df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
     if "Asset Class" in df.columns:
         df = df[df["Asset Class"].astype(str).str.strip() == "Equity"]
-    s = df["Ticker"].astype(str).str.strip().str.replace(".", "-", regex=False)
+    col = next((c for c in ("Ticker", "Symbol") if c in df.columns), df.columns[0])
+    s = df[col].astype(str).str.strip().str.replace(".", "-", regex=False)
     symbols = [x for x in s if x and x not in ("-", "nan") and x.replace("-", "").isalnum()]
     symbols = list(dict.fromkeys(symbols))
     if len(symbols) < 500:
-        raise RuntimeError("holdings file returned too few symbols")
+        raise RuntimeError(f"only {len(symbols)} symbols found (expected about 2,000)")
     return symbols
 
 
-def fetch_ishares_symbols(url):
-    """Downloads an iShares holdings CSV. iShares sometimes answers with an HTML
-    entry page instead of the file, so several request styles are tried."""
-    product_page = url.split("/1467271812596.ajax")[0]
-    errors = []
-
-    def attempt(label, getter):
-        try:
-            resp = getter()
-            resp.raise_for_status()
-            return _parse_ishares_csv(resp.text)
-        except Exception as e:
-            preview = ""
-            if "resp" in locals():
-                preview = " ".join(getattr(resp, "text", "")[:60].split())
-            errors.append(f"{label}: {e} {preview!r}".strip())
-            return None
-
-    # 1) dated requests: the file endpoint is reliably served when an asOfDate
-    #    (a recent business day) is supplied. Try the last few weekdays.
-    days, d = [], date.today()
-    while len(days) < 6:
-        d -= timedelta(days=1)
-        if d.weekday() < 5:
-            days.append(d.strftime("%Y%m%d"))
-    for as_of in days:
-        out = attempt(f"asOf {as_of}", lambda as_of=as_of: requests.get(f"{url}&asOfDate={as_of}", timeout=30))
-        if out:
-            return out
-
-    # 1b) plain request with no date
-    out = attempt("plain", lambda: requests.get(url, timeout=30))
-    if out:
-        return out
-
-    # 2) browser-like session: visit the fund page first to pick up cookies
-    def with_cookies():
-        s = requests.Session()
-        s.headers.update(WIKI_HEADERS)
-        s.headers["Accept-Language"] = "en-US,en;q=0.9"
-        s.get(product_page, params={"switchLocale": "y", "siteEntryPassthru": "true"}, timeout=30)
-        return s.get(url, headers={"Referer": product_page, "Accept": "text/csv,*/*"}, timeout=30)
-
-    out = attempt("session", with_cookies)
-    if out:
-        return out
-
-    raise RuntimeError(f"{len(errors)} attempts all returned a web page, not a CSV. Last: {errors[-1]}")
+def fetch_ishares_symbols(url=None):
+    """iShares blocks scripted downloads, so the Russell 2000 list comes from a
+    saved file (data/russell2000.csv). Save one from inside the app via
+    'Use my own stock list' -> 'Save as Russell 2000 list'."""
+    if not RUSSELL_FILE.exists():
+        raise RuntimeError("no saved Russell 2000 list yet")
+    return _parse_holdings_csv(RUSSELL_FILE.read_text(encoding="utf-8-sig"))
 
 
 def get_tickers_for_market(market_name, exchange="NSE"):
@@ -398,9 +363,10 @@ def get_tickers_for_market(market_name, exchange="NSE"):
             return fetch_ishares_symbols(spec["url"])
         except Exception as e:
             raise RuntimeError(
-                f"Could not read the {market_name} holdings file ({e}). Download the IWM "
-                "holdings CSV from ishares.com and upload it via 'Use my own stock list' "
-                "(choose 'US / global')."
+                f"{market_name} needs a saved list ({e}). One-time setup: download the IWM "
+                "holdings CSV from ishares.com (Holdings -> Download), then in the sidebar "
+                "open 'Use my own stock list', upload it, and click 'Save as Russell 2000 list'. "
+                "After that this index scans normally."
             )
 
     if kind == "us":

@@ -1,425 +1,678 @@
+"""
+core.py
+Golden Gate EMA Scanner - core logic (shared by CLI script and web app)
+"""
+
+import io
+import time
+import urllib.parse
 import warnings
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-from plotly.subplots import make_subplots
+import requests
+import yfinance as yf
 
-from core import (
-    MARKET_GROUPS, TIMEFRAME_MAP, INTRADAY_INTERVALS, is_nse_market,
-    run_scan, run_multi_timeframe_scan, get_chart_data,
-    EMA_CONVERGENCE_PCT, PRICE_TO_EMA_PCT, BREAKOUT_LEVELS, GG_LOOKBACK_BARS, VOLUME_SPIKE_MULTIPLIER,
+# ============================== CONFIG ======================================
+
+EMA_PERIODS = [20, 50, 100, 200]
+
+EMA_CONVERGENCE_PCT = 1.0      # all 4 EMAs must be within this % of each other
+PRICE_TO_EMA_PCT = 1.0         # price must be within this % of the EMA cluster (avg of 4 EMAs)
+
+BREAKOUT_LEVELS = [5, 10, 15, 20]
+GG_LOOKBACK_BARS = 50
+
+VOLUME_AVG_PERIOD = 20
+VOLUME_SPIKE_MULTIPLIER = 1.5
+
+MAX_WORKERS = 5                # parallel yfinance downloads (raise carefully - Yahoo rate-limits)
+
+NSE_ARCHIVE = "https://nsearchives.nseindia.com/content/indices/"
+
+# ------------------------------ NSE indices ----------------------------------
+# display name -> (archive CSV file name, NSE live-API index name)
+# The archive file names follow NSE's convention; if one ever changes, the
+# scanner automatically falls back to NSE's live JSON API using the API name.
+_NSE = {
+    "🇮🇳 NSE · Broad Market": {
+        "NIFTY 50": ("ind_nifty50list.csv", "NIFTY 50"),
+        "NIFTY NEXT 50": ("ind_niftynext50list.csv", "NIFTY NEXT 50"),
+        "NIFTY 100": ("ind_nifty100list.csv", "NIFTY 100"),
+        "NIFTY 200": ("ind_nifty200list.csv", "NIFTY 200"),
+        "NIFTY 500": ("ind_nifty500list.csv", "NIFTY 500"),
+        "NIFTY TOTAL MARKET": ("ind_niftytotalmarket_list.csv", "NIFTY TOTAL MARKET"),
+        "NIFTY LARGEMIDCAP 250": ("ind_niftylargemidcap250list.csv", "NIFTY LARGEMIDCAP 250"),
+        "NIFTY MIDCAP 50": ("ind_niftymidcap50list.csv", "NIFTY MIDCAP 50"),
+        "NIFTY MIDCAP 100": ("ind_niftymidcap100list.csv", "NIFTY MIDCAP 100"),
+        "NIFTY MIDCAP 150": ("ind_niftymidcap150list.csv", "NIFTY MIDCAP 150"),
+        "NIFTY MIDSMALLCAP 400": ("ind_niftymidsmallcap400list.csv", "NIFTY MIDSMALLCAP 400"),
+        "NIFTY SMALLCAP 50": ("ind_niftysmallcap50list.csv", "NIFTY SMALLCAP 50"),
+        "NIFTY SMALLCAP 100": ("ind_niftysmallcap100list.csv", "NIFTY SMALLCAP 100"),
+        "NIFTY SMALLCAP 250": ("ind_niftysmallcap250list.csv", "NIFTY SMALLCAP 250"),
+        "NIFTY MICROCAP 250": ("ind_niftymicrocap250_list.csv", "NIFTY MICROCAP 250"),
+    },
+    "🇮🇳 NSE · Sectoral": {
+        "NIFTY BANK": ("ind_niftybanklist.csv", "NIFTY BANK"),
+        "NIFTY PRIVATE BANK": ("ind_niftyprivatebanklist.csv", "NIFTY PRIVATE BANK"),
+        "NIFTY PSU BANK": ("ind_niftypsubanklist.csv", "NIFTY PSU BANK"),
+        "NIFTY FINANCIAL SERVICES": ("ind_niftyfinancelist.csv", "NIFTY FINANCIAL SERVICES"),
+        "NIFTY IT": ("ind_niftyitlist.csv", "NIFTY IT"),
+        "NIFTY FMCG": ("ind_niftyfmcglist.csv", "NIFTY FMCG"),
+        "NIFTY PHARMA": ("ind_niftypharmalist.csv", "NIFTY PHARMA"),
+        "NIFTY HEALTHCARE": ("ind_niftyhealthcarelist.csv", "NIFTY HEALTHCARE INDEX"),
+        "NIFTY AUTO": ("ind_niftyautolist.csv", "NIFTY AUTO"),
+        "NIFTY METAL": ("ind_niftymetallist.csv", "NIFTY METAL"),
+        "NIFTY ENERGY": ("ind_niftyenergylist.csv", "NIFTY ENERGY"),
+        "NIFTY OIL & GAS": ("ind_niftyoilgaslist.csv", "NIFTY OIL & GAS"),
+        "NIFTY REALTY": ("ind_niftyrealtylist.csv", "NIFTY REALTY"),
+        "NIFTY MEDIA": ("ind_niftymedialist.csv", "NIFTY MEDIA"),
+        "NIFTY CONSUMER DURABLES": ("ind_niftyconsumerdurableslist.csv", "NIFTY CONSUMER DURABLES"),
+    },
+    "🇮🇳 NSE · Thematic": {
+        "NIFTY INFRASTRUCTURE": ("ind_niftyinfralist.csv", "NIFTY INFRASTRUCTURE"),
+        "NIFTY COMMODITIES": ("ind_niftycommoditieslist.csv", "NIFTY COMMODITIES"),
+        "NIFTY INDIA CONSUMPTION": ("ind_niftyconsumptionlist.csv", "NIFTY INDIA CONSUMPTION"),
+        "NIFTY MNC": ("ind_niftymnclist.csv", "NIFTY MNC"),
+        "NIFTY PSE": ("ind_niftypselist.csv", "NIFTY PSE"),
+        "NIFTY SERVICES SECTOR": ("ind_niftyservicelist.csv", "NIFTY SERVICES SECTOR"),
+    },
+}
+
+# ------------------------------ BSE ------------------------------------------
+# BSE does not publish a stable machine-readable constituent file, so BSE
+# indices here are bundled snapshots (Yahoo tickers end in .BO). For other BSE
+# indices, use the CSV upload in the sidebar with the "BSE" exchange option.
+BSE_SENSEX_30 = [
+    "ADANIPORTS", "ASIANPAINT", "AXISBANK", "BAJFINANCE", "BAJAJFINSV",
+    "BEL", "BHARTIARTL", "ETERNAL", "HCLTECH", "HDFCBANK",
+    "HINDUNILVR", "ICICIBANK", "INFY", "ITC", "KOTAKBANK",
+    "LT", "M&M", "MARUTI", "NTPC", "POWERGRID",
+    "RELIANCE", "SBIN", "SUNPHARMA", "TATAMOTORS", "TATASTEEL",
+    "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO",
+]
+
+# ------------------------------ US indices -----------------------------------
+# Constituents are read live from Wikipedia's index pages (no API key needed).
+_US = {
+    "S&P 500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+    "NASDAQ 100": "https://en.wikipedia.org/wiki/Nasdaq-100",
+    "DOW JONES 30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+    "S&P MIDCAP 400": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+    "S&P SMALLCAP 600": "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
+}
+US_FALLBACK = {
+    "DOW JONES 30": [
+        "AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
+        "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
+        "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT",
+    ],
+}
+
+# ------------------------------ Crypto & commodities -------------------------
+_STATIC = {
+    "₿ Crypto": {
+        "CRYPTO - MAJOR": [
+            "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
+            "ADA-USD", "DOGE-USD", "POL-USD", "DOT-USD", "LTC-USD",
+            "AVAX-USD", "LINK-USD", "TRX-USD", "SHIB-USD", "ATOM-USD",
+        ],
+    },
+    "🛢️ Commodities": {
+        "COMMODITIES - METALS": ["GC=F", "SI=F", "PL=F", "PA=F", "HG=F"],
+        "COMMODITIES - ENERGY": ["CL=F", "BZ=F", "NG=F", "RB=F", "HO=F"],
+        "COMMODITIES - AGRICULTURE": ["ZC=F", "ZW=F", "ZS=F", "KC=F", "SB=F", "CT=F", "CC=F"],
+    },
+}
+
+STATIC_TICKER_LABELS = {
+    "BTC-USD": "BITCOIN", "ETH-USD": "ETHEREUM", "BNB-USD": "BNB", "SOL-USD": "SOLANA",
+    "XRP-USD": "XRP", "ADA-USD": "CARDANO", "DOGE-USD": "DOGECOIN", "POL-USD": "POLYGON",
+    "DOT-USD": "POLKADOT", "LTC-USD": "LITECOIN", "AVAX-USD": "AVALANCHE", "LINK-USD": "CHAINLINK",
+    "TRX-USD": "TRON", "SHIB-USD": "SHIBA INU", "ATOM-USD": "COSMOS",
+    "GC=F": "GOLD", "SI=F": "SILVER", "PL=F": "PLATINUM", "PA=F": "PALLADIUM", "HG=F": "COPPER",
+    "CL=F": "CRUDE OIL (WTI)", "BZ=F": "BRENT CRUDE", "NG=F": "NATURAL GAS",
+    "RB=F": "GASOLINE", "HO=F": "HEATING OIL",
+    "ZC=F": "CORN", "ZW=F": "WHEAT", "ZS=F": "SOYBEANS", "KC=F": "COFFEE",
+    "SB=F": "SUGAR", "CT=F": "COTTON", "CC=F": "COCOA",
+}
+
+# ------------------------------ Market registry ------------------------------
+MARKETS = {}          # name -> spec dict
+MARKET_GROUPS = {}    # group label -> [market names]
+
+for _group, _items in _NSE.items():
+    MARKET_GROUPS[_group] = list(_items)
+    for _name, (_file, _api) in _items.items():
+        MARKETS[_name] = {"kind": "nse", "url": NSE_ARCHIVE + _file, "api": _api}
+
+MARKET_GROUPS["🇮🇳 BSE"] = ["BSE SENSEX 30"]
+MARKETS["BSE SENSEX 30"] = {"kind": "bse", "symbols": BSE_SENSEX_30}
+
+MARKET_GROUPS["🇺🇸 US Indices"] = list(_US)
+for _name, _url in _US.items():
+    MARKETS[_name] = {"kind": "us", "url": _url}
+
+# Russell 2000 has no free official constituent list, so we read the holdings
+# file of iShares' IWM ETF, which tracks it (~1,900-2,000 stocks).
+IWM_HOLDINGS_URL = (
+    "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+    "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+)
+MARKET_GROUPS["🇺🇸 US Indices"].append("RUSSELL 2000")
+MARKETS["RUSSELL 2000"] = {"kind": "ishares", "url": IWM_HOLDINGS_URL}
+
+for _group, _items in _STATIC.items():
+    MARKET_GROUPS[_group] = list(_items)
+    for _name, _tickers in _items.items():
+        MARKETS[_name] = {"kind": "static", "tickers": _tickers}
+
+ALL_MARKETS = list(MARKETS)
+
+FALLBACK_INDEX_LISTS = {
+    "NIFTY 50": [
+        "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+        "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL",
+        "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY", "EICHERMOT",
+        "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO",
+        "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC", "INDUSINDBK",
+        "INFY", "JSWSTEEL", "KOTAKBANK", "LT", "LTIM",
+        "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+        "POWERGRID", "RELIANCE", "SBILIFE", "SHRIRAMFIN", "SBIN",
+        "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TCS",
+        "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+    ],
+}
+FALLBACK_LIST_NOTE = (
+    "Bundled fallback list used because the live fetch failed. This is a "
+    "point-in-time snapshot and may not reflect the latest index rebalancing - "
+    "verify against the exchange website if precision matters."
 )
 
-st.set_page_config(page_title="Golden Gate EMA Scanner", page_icon="🌉", layout="wide")
-
-# --------------------------------------------------------------------------- #
-#  Look & feel: fog-grey canvas, deep navy ink, one bridge-orange signal colour
-# --------------------------------------------------------------------------- #
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Source+Sans+3:wght@400;500;600&display=swap');
-
-:root {
-  --fog: #eef1f4; --panel: #ffffff; --ink: #14213d; --ink-soft: #5b6678;
-  --line: #dde3ea; --gate: #d9480f; --gate-soft: #fff0e8;
-  --up: #0b7a55; --down: #be123c;
+# label -> (yfinance interval, yfinance period, resample_to)
+TIMEFRAME_MAP = {
+    "5 minute": ("5m", "60d", None),
+    "15 minute": ("15m", "60d", None),
+    "30 minute": ("30m", "60d", None),
+    "1 hour": ("60m", "730d", None),
+    "4 hour": ("60m", "730d", "4h"),
+    "Daily": ("1d", "5y", None),
+    "Weekly": ("1wk", "10y", None),
 }
-html, body, [class*="css"], .stApp { font-family: 'Source Sans 3', sans-serif; color: var(--ink); }
-.stApp { background: var(--fog); }
-.block-container { padding-top: 2rem; max-width: 1280px; }
-h1, h2, h3, h4 { font-family: 'Sora', sans-serif !important; letter-spacing: -0.01em; color: var(--ink); }
+INTRADAY_INTERVALS = ("5m", "15m", "30m", "60m")
 
-/* Hero */
-.hero {
-  display: grid; grid-template-columns: 1.1fr 1fr; gap: 24px; align-items: center;
-  background: var(--ink); color: #fff; border-radius: 20px; padding: 30px 36px; margin-bottom: 18px;
+# =============================================================================
+
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/market-data/live-equity-market",
+    "Connection": "keep-alive",
 }
-.hero h1 { font-size: 2.3rem; line-height: 1.1; margin: 0 0 10px; color: #fff !important; }
-.hero p { color: #b8c3d6; font-size: 1.05rem; margin: 0; max-width: 46ch; line-height: 1.5; }
-.hero svg { width: 100%; height: auto; display: block; }
-@media (max-width: 800px) { .hero { grid-template-columns: 1fr; padding: 24px; } .hero h1 { font-size: 1.8rem; } }
-
-/* Notice */
-.notice {
-  background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--gate);
-  border-radius: 10px; padding: 12px 16px; font-size: .92rem; color: var(--ink-soft); margin-bottom: 20px;
-}
-.notice b { color: var(--ink); }
-
-/* Summary figures */
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 14px 0 22px; }
-.kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
-.kpi .label { font-size: .85rem; color: var(--ink-soft); }
-.kpi .value { font-family: 'Sora', sans-serif; font-size: 1.9rem; font-weight: 600; line-height: 1.2; }
-.kpi.signal { background: var(--gate-soft); border-color: #f4c3a8; }
-.kpi.signal .value { color: var(--gate); }
-.kpi .sub { font-size: .8rem; color: var(--ink-soft); }
-
-/* Sidebar */
-[data-testid="stSidebar"] { background: var(--panel); border-right: 1px solid var(--line); }
-[data-testid="stSidebar"] h2 { font-size: 1.15rem; }
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid var(--line); }
-.stTabs [data-baseweb="tab"] { height: 44px; padding: 0 16px; color: var(--ink-soft); font-weight: 600; }
-.stTabs [aria-selected="true"] { color: var(--gate) !important; }
-.stTabs [data-baseweb="tab-highlight"] { background-color: var(--gate) !important; }
-
-/* Primary button */
-.stButton > button[kind="primary"], .stDownloadButton > button {
-  background: var(--gate); border: 0; color: #fff; font-weight: 600; border-radius: 10px; padding: .55rem 1rem;
-}
-.stButton > button[kind="primary"]:hover, .stDownloadButton > button:hover { background: #b83c0a; color: #fff; }
-.stButton > button[kind="primary"]:disabled { background: #e4c2b3; }
-
-/* Tables */
-[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-.foot { color: var(--ink-soft); font-size: .82rem; line-height: 1.5; border-top: 1px solid var(--line); padding-top: 14px; margin-top: 28px; }
-</style>
-
-<div class="hero">
-  <div>
-    <h1>Golden Gate EMA Scanner</h1>
-    <p>Find stocks, crypto and commodities where the 20, 50, 100 and 200 EMAs squeeze together
-    around price, and see what happened after the gate opened.</p>
-  </div>
-  <svg viewBox="0 0 520 170" role="img" aria-label="Four moving averages converging into one point">
-    <g fill="none" stroke-linecap="round" stroke-width="3">
-      <path d="M0,150 C150,150 280,92 420,86 S500,90 520,90" stroke="#4a5d82"/>
-      <path d="M0,108 C150,108 280,84 420,82 S500,82 520,82" stroke="#7d8fb3"/>
-      <path d="M0,62 C150,62 280,78 420,79 S500,76 520,74" stroke="#aebbd6"/>
-      <path d="M0,20 C150,20 280,74 420,76 S500,70 520,66" stroke="#ff7a3d"/>
-    </g>
-    <circle cx="420" cy="81" r="15" fill="none" stroke="#ff7a3d" stroke-width="2" opacity=".55"/>
-    <circle cx="420" cy="81" r="4.5" fill="#ff7a3d"/>
-  </svg>
-</div>
-
-<div class="notice">
-  <b>Educational screening tool, not investment advice.</b> It is not registered with SEBI as a
-  Research Analyst or Investment Adviser. Output is a mechanical calculation of EMA relationships
-  and is not a recommendation to buy or sell anything. All trading and investment decisions, and
-  the risks that come with them, are yours.
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# --------------------------------------------------------------------------- #
-#  Sidebar
-# --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.header("Scan settings")
-
-    group = st.selectbox("Market group", list(MARKET_GROUPS.keys()))
-    index_name = st.selectbox("Index / basket", MARKET_GROUPS[group])
-
-    exchange = "NSE"
-    if is_nse_market(index_name):
-        exchange = st.radio(
-            "Listing to scan", ["NSE", "BSE"], horizontal=True,
-            help="BSE maps each constituent to its BSE listing (.BO). A few stocks "
-                 "have no matching BSE ticker on Yahoo and are skipped.",
-        )
-
-    timeframe_labels = st.multiselect(
-        "Timeframes (1 to 3)", list(TIMEFRAME_MAP.keys()), default=["Daily"], max_selections=3,
-    )
-    if not timeframe_labels:
-        st.caption("Select at least one timeframe.")
-
-    with st.expander("Rule thresholds"):
-        st.caption(
-            "A Golden Gate needs both conditions at once, which is rare, so zero matches "
-            "on many days is normal. Loosen the limits for more matches, or check the "
-            "'Closest to forming' tab."
-        )
-        ema_pct = st.slider("EMA convergence (%)", 0.2, 5.0, EMA_CONVERGENCE_PCT, 0.1)
-        price_pct = st.slider("Price distance from EMAs (%)", 0.2, 5.0, PRICE_TO_EMA_PCT, 0.1)
-        lookback = st.slider("Lookback window (bars)", 10, 200, GG_LOOKBACK_BARS, 10)
-        breakout_levels = st.multiselect(
-            "Breakout levels (%)", [3, 5, 8, 10, 15, 20, 25], default=BREAKOUT_LEVELS,
-        )
-        volume_spike_mult = st.slider(
-            "Volume spike (x average)", 1.1, 5.0, VOLUME_SPIKE_MULTIPLIER, 0.1,
-            help="Latest bar's volume vs the average of the prior 20 bars.",
-        )
-
-    custom_tickers, custom_suffix = None, ".NS"
-    with st.expander("Use my own stock list"):
-        st.caption(
-            "Upload a CSV with a 'Symbol' column, or type symbols below. Use this for any "
-            "index not listed here (for example other BSE indices), or when the exchange "
-            "blocks automated requests."
-        )
-        suffix_label = st.selectbox(
-            "My symbols are listed on",
-            ["NSE (.NS)", "BSE (.BO)", "US / global (as typed)"],
-        )
-        custom_suffix = {"NSE (.NS)": ".NS", "BSE (.BO)": ".BO"}.get(suffix_label, "")
-        typed = st.text_area("Symbols (comma or line separated)", placeholder="RELIANCE, TCS, INFY", height=80)
-        uploaded = st.file_uploader("or upload CSV", type=["csv"])
-
-        symbols = [s for s in typed.replace("\n", ",").split(",") if s.strip()]
-        if uploaded is not None:
-            try:
-                up_df = pd.read_csv(uploaded)
-                col = "Symbol" if "Symbol" in up_df.columns else up_df.columns[0]
-                symbols += up_df[col].astype(str).tolist()
-            except Exception as e:
-                st.error(f"Couldn't read the file: {e}")
-        if symbols:
-            custom_tickers = symbols
-            st.success(f"{len(symbols)} symbols loaded. They will be scanned instead of the index above.")
-
-    run_button = st.button("Run scan", type="primary", width="stretch", disabled=not timeframe_labels)
+WIKI_HEADERS = {"User-Agent": NSE_HEADERS["User-Agent"]}
 
 
-# --------------------------------------------------------------------------- #
-#  Helpers
-# --------------------------------------------------------------------------- #
-def style_gg(dataframe):
-    """Colour-codes signal, trend, price-action and volume columns."""
-    def color_cell(val):
-        if not isinstance(val, str):
-            return ""
-        v = val.strip()
-        if v.startswith("Formed"):
-            return "color: #d9480f; font-weight: 700; background-color: #fff0e8"
-        if v in ("Uptrend", "Yes", "High") or v.startswith("Bullish"):
-            return "color: #0b7a55; font-weight: 600"
-        if v in ("Downtrend", "Low") or v.startswith("Bearish"):
-            return "color: #be123c"
-        if v in ("Not Formed", "Mixed", "No", "Unknown", "Medium"):
-            return "color: #7b8798"
-        if v == "No Data":
-            return "color: #9aa5b4; font-style: italic"
-        return ""
-
-    prefixes = ("Golden Gate", "EMA Breakout Signal", "Trend", "Price Action", "Volume Spike", "Liquidity")
-    subset = [c for c in dataframe.columns if c.startswith(prefixes)]
-    styler = dataframe.style
-    if hasattr(styler, "map"):
-        return styler.map(color_cell, subset=subset)
-    return styler.applymap(color_cell, subset=subset)
+def is_nse_market(name):
+    return MARKETS.get(name, {}).get("kind") == "nse"
 
 
-def kpi(label, value, sub="", signal=False):
-    cls = "kpi signal" if signal else "kpi"
-    return (f'<div class="{cls}"><div class="label">{label}</div>'
-            f'<div class="value">{value}</div><div class="sub">{sub}</div></div>')
+# ----------------------------- constituent fetchers --------------------------
+
+def get_index_symbols(url, max_retries=3):
+    """Official NSE archive CSV -> list of 'SYMBOL.NS'."""
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            session = requests.Session()
+            session.headers.update(NSE_HEADERS)
+            session.get("https://www.nseindia.com", timeout=10)
+            time.sleep(1)
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+            symbols = df["Symbol"].astype(str).str.strip().tolist()
+            return [f"{s}.NS" for s in symbols]
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+    raise RuntimeError(str(last_error))
 
 
-def show_table(d, height=480):
-    if d.empty:
-        st.info("Nothing matches yet. Loosen the thresholds in the sidebar or check another tab.")
-        return
-    st.dataframe(style_gg(d.drop(columns=["Ticker"], errors="ignore")),
-                 width="stretch", height=height, hide_index=True)
+def get_index_symbols_via_api(index_api_name, max_retries=2):
+    """NSE's live JSON API (fallback when the archive CSV is blocked/moved)."""
+    url = f"https://www.nseindia.com/api/equity-stockIndices?index={urllib.parse.quote(index_api_name)}"
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            session = requests.Session()
+            session.headers.update(NSE_HEADERS)
+            session.get("https://www.nseindia.com", timeout=10)
+            time.sleep(1)
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            rows = resp.json().get("data", [])
+            symbols = [
+                str(r["symbol"]).strip() for r in rows
+                if "symbol" in r and str(r["symbol"]).strip().upper() != index_api_name.upper()
+            ]
+            if not symbols:
+                raise RuntimeError("API returned no constituent symbols")
+            return [f"{s}.NS" for s in symbols]
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+    raise RuntimeError(str(last_error))
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_chart(ticker, tf_label):
-    return get_chart_data(ticker, tf_label)
-
-
-def draw_chart(d, title, intraday):
-    x = d.index.strftime("%d %b %H:%M") if intraday else d.index
-    has_vol = "Volume" in d.columns and d["Volume"].fillna(0).sum() > 0
-    fig = make_subplots(rows=2 if has_vol else 1, cols=1, shared_xaxes=True,
-                        row_heights=[0.78, 0.22] if has_vol else [1], vertical_spacing=0.03)
-    fig.add_trace(go.Candlestick(
-        x=x, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Price",
-        increasing_line_color="#0b7a55", decreasing_line_color="#be123c",
-        increasing_fillcolor="#0b7a55", decreasing_fillcolor="#be123c"), row=1, col=1)
-    for col, color in (("EMA20", "#ff7a3d"), ("EMA50", "#4a5d82"), ("EMA100", "#7d8fb3"), ("EMA200", "#14213d")):
-        fig.add_trace(go.Scatter(x=x, y=d[col], name=col, line=dict(color=color, width=1.6)), row=1, col=1)
-    if has_vol:
-        fig.add_trace(go.Bar(x=x, y=d["Volume"], name="Volume", marker_color="#c5cfdd"), row=2, col=1)
-    fig.update_layout(
-        title=dict(text=title, font=dict(family="Sora", size=16)),
-        height=620, margin=dict(l=10, r=10, t=50, b=10), paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff", xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.06),
-        font=dict(family="Source Sans 3", color="#14213d"),
-    )
-    fig.update_xaxes(gridcolor="#eef1f4")
-    fig.update_yaxes(gridcolor="#eef1f4")
-    if intraday:
-        fig.update_xaxes(type="category", nticks=10)
-    return fig
-
-
-def chart_explorer(df, timeframes):
-    c1, c2 = st.columns([2, 1])
-    symbol = c1.selectbox("Symbol", df["Symbol"].tolist(), key="chart_symbol")
-    tf = c2.selectbox("Timeframe", timeframes, key="chart_tf")
-    ticker = dict(zip(df["Symbol"], df["Ticker"]))[symbol]
-    with st.spinner("Loading chart..."):
-        data = load_chart(ticker, tf)
-    if data is None:
-        st.info("No price data available for this symbol and timeframe.")
-        return
-    intraday = TIMEFRAME_MAP[tf][0] in INTRADAY_INTERVALS
-    st.plotly_chart(draw_chart(data, f"{symbol} · {tf}", intraday), width="stretch")
-
-
-# --------------------------------------------------------------------------- #
-#  Run scan
-# --------------------------------------------------------------------------- #
-if "results_df" not in st.session_state:
-    st.session_state.results_df = None
-    st.session_state.last_scan_info = None
-
-if run_button and timeframe_labels:
-    progress_bar = st.progress(0, text="Fetching constituents...")
-    status_text = st.empty()
-    tf_display = " + ".join(timeframe_labels)
-
-    def update_progress(i, total, symbol, result):
-        status_text.text(f"[{i}/{total}] {symbol}")
-        progress_bar.progress(i / total, text=f"Scanning {index_name} ({tf_display})... {i}/{total}")
-
-    scan_args = dict(
-        progress_callback=update_progress,
-        custom_tickers=custom_tickers,
-        ema_convergence_pct=ema_pct,
-        price_to_ema_pct=price_pct,
-        breakout_levels=breakout_levels,
-        gg_lookback_bars=lookback,
-        volume_spike_multiplier=volume_spike_mult,
-        exchange=exchange,
-        custom_suffix=custom_suffix,
-    )
+def fetch_nse_index_symbols(market_name, spec):
     try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            if len(timeframe_labels) == 1:
-                df = run_scan(index_name, timeframe_labels[0], **scan_args)
-            else:
-                df = run_multi_timeframe_scan(index_name, timeframe_labels, **scan_args)
-        for w in caught:
-            st.info(f"ℹ️ {w.message}")
-        label = "Custom list" if custom_tickers else index_name
-        if exchange == "BSE" and not custom_tickers:
-            label += " (BSE listings)"
-        st.session_state.results_df = df
-        st.session_state.last_scan_info = {
-            "index": label, "timeframe": tf_display, "timeframes": list(timeframe_labels),
-            "multi": len(timeframe_labels) > 1, "count": len(df),
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-    except Exception as e:
-        st.session_state.results_df = None
-        st.error(
-            f"Scan failed: {e}\n\nIf the exchange is blocking the request, use "
-            "'Use my own stock list' in the sidebar as a workaround."
-        )
-
-    progress_bar.empty()
-    status_text.empty()
-
-# --------------------------------------------------------------------------- #
-#  Results
-# --------------------------------------------------------------------------- #
-df = st.session_state.results_df
-
-if df is not None and not df.empty:
-    info = st.session_state.last_scan_info
-    st.markdown(f"### {info['index']}")
-    st.caption(f"{info['count']} symbols scanned on {info['timeframe']} at {info['time']}")
-
-    f1, f2 = st.columns([2, 3])
-    query = f1.text_input("Search symbol", placeholder="Type to filter, e.g. TATA", label_visibility="collapsed")
-    trend_pick = []
-    if not info["multi"]:
-        trend_pick = f2.multiselect("Trend", ["Uptrend", "Mixed", "Downtrend"], placeholder="Filter by trend",
-                                    label_visibility="collapsed")
-
-    view = df
-    if query.strip():
-        view = view[view["Symbol"].str.contains(query.strip(), case=False, na=False, regex=False)]
-    if trend_pick:
-        view = view[view["Trend"].isin(trend_pick)]
-
-    if info["multi"]:
-        gg_any = view[view["Golden Gate - Any TF"] == "Formed"]
-        ev_any = view[view["EMA Breakout Signal - Any TF"] == "Formed"]
-        st.markdown(
-            '<div class="kpis">'
-            + kpi("Symbols shown", len(view), f"of {len(df)} scanned")
-            + kpi("Golden Gate formed", len(gg_any), "on at least one timeframe", signal=True)
-            + kpi("Breakout signal", len(ev_any), "on at least one timeframe", signal=True)
-            + "</div>",
-            unsafe_allow_html=True,
-        )
-
-        summary_cols = ["Golden Gate - Any TF", "EMA Breakout Signal - Any TF"]
-        shown_cols = [c for c in view.columns if c not in summary_cols]
-
-        tab1, tab2, tab3, tab4 = st.tabs(["All results", "Golden Gate", "Breakout signal", "Chart"])
-        with tab1:
-            st.caption("Each timeframe gets its own columns so you can compare them at a glance.")
-            show_table(view[shown_cols], 550)
-        with tab2:
-            show_table(gg_any[shown_cols], 450)
-        with tab3:
-            show_table(ev_any[shown_cols], 450)
-        with tab4:
-            chart_explorer(view if not view.empty else df, info["timeframes"])
-    else:
-        gg_now = view[view["Golden Gate"] == "Formed"]
-        ev_now = view[view["EMA Breakout Signal"].str.startswith("Formed")]
-        spikes = view[view["Volume Spike"] == "Yes"]
-        uptrends = view[view["Trend"] == "Uptrend"]
-        st.markdown(
-            '<div class="kpis">'
-            + kpi("Symbols shown", len(view), f"of {len(df)} scanned")
-            + kpi("Golden Gate formed", len(gg_now), "right now", signal=True)
-            + kpi("Breakout signal", len(ev_now), "after a recent gate", signal=True)
-            + kpi("Volume spikes", len(spikes), "latest bar")
-            + kpi("In uptrend", len(uptrends), "EMA 20 > 50 > 100 > 200")
-            + "</div>",
-            unsafe_allow_html=True,
-        )
-
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(
-            ["All results", "Golden Gate", "Breakout signal", "Closest to forming", "Chart"]
-        )
-        with tab1:
-            show_table(view, 520)
-        with tab2:
-            show_table(gg_now, 420)
-        with tab3:
-            show_table(ev_now, 420)
-        with tab4:
-            st.caption(
-                "Ranked by EMA spread. The lowest numbers are the stocks whose EMAs are "
-                "most tightly bunched right now, even if they haven't qualified yet."
+        return get_index_symbols(spec["url"])
+    except Exception as csv_error:
+        try:
+            return get_index_symbols_via_api(spec["api"])
+        except Exception as api_error:
+            raise RuntimeError(
+                f"Could not fetch {market_name} from NSE via the archive CSV "
+                f"({csv_error}) or the live API ({api_error}). NSE often blocks cloud "
+                "servers; it usually works from a home connection in India. "
+                "You can also upload a stock list in the sidebar."
             )
-            closest = view.sort_values("EMA Spread %", ascending=True).head(20)
-            show_table(closest[["Symbol", "Ticker", "Last Close", "EMA Spread %", "Price Dev %", "Golden Gate"]], 520)
-        with tab5:
-            chart_explorer(view if not view.empty else df, info["timeframes"])
 
-    st.download_button(
-        "Download results as CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"golden_gate_scan_{info['index'].replace(' ', '_')}_{info['timeframe'].replace(' ', '_').replace('+', 'and')}.csv",
-        mime="text/csv",
+
+def fetch_us_symbols(url):
+    """Reads a Wikipedia index page and returns the constituent tickers
+    (Yahoo style: BRK.B -> BRK-B)."""
+    resp = requests.get(url, headers=WIKI_HEADERS, timeout=20)
+    resp.raise_for_status()
+    for table in pd.read_html(io.StringIO(resp.text)):
+        if isinstance(table.columns, pd.MultiIndex):
+            table.columns = [c[-1] for c in table.columns]
+        for col in ("Symbol", "Ticker"):
+            if col in table.columns and len(table) >= 20:
+                s = (
+                    table[col].astype(str)
+                    .str.replace(r"\[.*?\]", "", regex=True)
+                    .str.split(":").str[-1]
+                    .str.strip()
+                    .str.replace(".", "-", regex=False)
+                )
+                symbols = [x for x in s if x and x.lower() != "nan"]
+                if len(symbols) >= 20:
+                    return symbols
+    raise RuntimeError("No constituent table found on the page")
+
+
+def fetch_ishares_symbols(url):
+    """Reads an iShares ETF holdings CSV (a few preamble lines, then a header
+    row starting with 'Ticker') and returns the equity tickers, Yahoo style."""
+    resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
+    resp.raise_for_status()
+    lines = resp.text.lstrip("\ufeff").splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("Ticker,")), None)
+    if start is None:
+        raise RuntimeError("Holdings file format not recognised")
+    df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+    if "Asset Class" in df.columns:
+        df = df[df["Asset Class"].astype(str).str.strip() == "Equity"]
+    s = df["Ticker"].astype(str).str.strip().str.replace(".", "-", regex=False)
+    symbols = [x for x in s if x and x not in ("-", "nan") and x.replace("-", "").isalnum()]
+    symbols = list(dict.fromkeys(symbols))
+    if len(symbols) < 500:
+        raise RuntimeError("Holdings file returned too few symbols")
+    return symbols
+
+
+def get_tickers_for_market(market_name, exchange="NSE"):
+    """Returns a yfinance-ready ticker list. For NSE indices, exchange='BSE'
+    maps every constituent to its BSE listing (.BO) instead of NSE (.NS)."""
+    spec = MARKETS.get(market_name)
+    if spec is None:
+        raise ValueError(f"Unknown market: {market_name}")
+    kind = spec["kind"]
+
+    if kind == "static":
+        return list(spec["tickers"])
+
+    if kind == "bse":
+        return [f"{s}.BO" for s in spec["symbols"]]
+
+    if kind == "ishares":
+        try:
+            return fetch_ishares_symbols(spec["url"])
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not read the {market_name} holdings file ({e}). Download the IWM "
+                "holdings CSV from ishares.com and upload it via 'Use my own stock list' "
+                "(choose 'US / global')."
+            )
+
+    if kind == "us":
+        try:
+            return fetch_us_symbols(spec["url"])
+        except Exception as e:
+            if market_name in US_FALLBACK:
+                warnings.warn(f"{FALLBACK_LIST_NOTE} (Live fetch error: {e})")
+                return list(US_FALLBACK[market_name])
+            raise RuntimeError(
+                f"Could not read the {market_name} constituent list ({e}). "
+                "Upload a stock list in the sidebar instead."
+            )
+
+    # NSE
+    try:
+        tickers = fetch_nse_index_symbols(market_name, spec)
+    except Exception as e:
+        if market_name in FALLBACK_INDEX_LISTS:
+            warnings.warn(f"{FALLBACK_LIST_NOTE} (Live fetch error: {e})")
+            tickers = [f"{s}.NS" for s in FALLBACK_INDEX_LISTS[market_name]]
+        else:
+            raise
+    if exchange == "BSE":
+        tickers = [t[:-3] + ".BO" for t in tickers]
+    return tickers
+
+
+def build_custom_tickers(symbols, suffix):
+    """suffix: '.NS', '.BO' or '' (global tickers used as typed)."""
+    out = []
+    for s in symbols:
+        s = str(s).strip().upper()
+        if not s or s == "NAN":
+            continue
+        out.append(s if (not suffix or s.endswith(suffix) or "." in s or "=" in s or "-" in s) else s + suffix)
+    return list(dict.fromkeys(out))
+
+
+def display_symbol(ticker):
+    if ticker in STATIC_TICKER_LABELS:
+        return STATIC_TICKER_LABELS[ticker]
+    for suf in (".NS", ".BO"):
+        if ticker.endswith(suf):
+            return ticker[: -len(suf)]
+    return ticker
+
+
+# ----------------------------- price data & indicators -----------------------
+
+def fetch_price_data(ticker, interval, period, resample_to=None):
+    data = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+    if data is None or data.empty:
+        return None
+    data = data.dropna(how="all")
+
+    if resample_to:
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        if "Volume" in data.columns:
+            agg["Volume"] = "sum"
+        data = data.resample(resample_to, label="right", closed="right").agg(agg)
+        data = data.dropna(subset=["Open", "High", "Low", "Close"])
+    return data
+
+
+def compute_emas(df):
+    for p in EMA_PERIODS:
+        df[f"EMA{p}"] = df["Close"].ewm(span=p, adjust=False).mean()
+    df["EMA_avg"] = df[[f"EMA{p}" for p in EMA_PERIODS]].mean(axis=1)
+    return df
+
+
+def get_chart_data(ticker, timeframe_label, bars=250):
+    """Price + EMA data for the chart explorer."""
+    interval, period, resample_to = TIMEFRAME_MAP[timeframe_label]
+    df = fetch_price_data(ticker, interval, period, resample_to=resample_to)
+    if df is None or df.empty:
+        return None
+    return compute_emas(df).tail(bars)
+
+
+def golden_gate_metrics(row):
+    emas = [row[f"EMA{p}"] for p in EMA_PERIODS]
+    if any(pd.isna(e) for e in emas):
+        return None, None
+    max_e, min_e = max(emas), min(emas)
+    if min_e <= 0:
+        return None, None
+    spread = (max_e - min_e) / min_e * 100
+    cluster = sum(emas) / len(emas)
+    return spread, abs(row["Close"] - cluster) / cluster * 100
+
+
+def is_golden_gate(row, ema_convergence_pct=EMA_CONVERGENCE_PCT, price_to_ema_pct=PRICE_TO_EMA_PCT):
+    spread, dev = golden_gate_metrics(row)
+    if spread is None:
+        return False
+    return spread <= ema_convergence_pct and dev <= price_to_ema_pct
+
+
+def compute_trend(latest):
+    e20, e50, e100, e200 = latest["EMA20"], latest["EMA50"], latest["EMA100"], latest["EMA200"]
+    if any(pd.isna(v) for v in [e20, e50, e100, e200]):
+        return "Unknown"
+    if e20 > e50 > e100 > e200:
+        return "Uptrend"
+    if e20 < e50 < e100 < e200:
+        return "Downtrend"
+    return "Mixed"
+
+
+def compute_price_action(df):
+    if len(df) < 2:
+        return "Unknown", None
+    latest = df.iloc[-1]
+    prev_close = df.iloc[-2]["Close"]
+    direction = "Bullish" if latest["Close"] >= latest["Open"] else "Bearish"
+    pct = (latest["Close"] - prev_close) / prev_close * 100 if prev_close else None
+    return direction, round(pct, 2) if pct is not None else None
+
+
+def compute_volume_metrics(df, volume_avg_period=VOLUME_AVG_PERIOD, spike_multiplier=VOLUME_SPIKE_MULTIPLIER):
+    if "Volume" not in df.columns or df["Volume"].isna().all():
+        return None, None, False
+    latest_volume = df["Volume"].iloc[-1]
+    avg_volume = df["Volume"].tail(volume_avg_period + 1).iloc[:-1].mean()
+    if pd.isna(avg_volume) or avg_volume <= 0:
+        return (float(latest_volume) if not pd.isna(latest_volume) else None), None, False
+    return float(latest_volume), float(avg_volume), bool(latest_volume >= spike_multiplier * avg_volume)
+
+
+def analyze_stock(ticker, interval, period, resample_to=None, ema_convergence_pct=EMA_CONVERGENCE_PCT,
+                  price_to_ema_pct=PRICE_TO_EMA_PCT, breakout_levels=BREAKOUT_LEVELS,
+                  gg_lookback_bars=GG_LOOKBACK_BARS, volume_spike_multiplier=VOLUME_SPIKE_MULTIPLIER):
+    df = fetch_price_data(ticker, interval, period, resample_to=resample_to)
+    if df is None or len(df) < max(EMA_PERIODS) + 5:
+        return None
+
+    df = compute_emas(df)
+
+    # Vectorised Golden Gate test over every bar
+    emas = df[[f"EMA{p}" for p in EMA_PERIODS]]
+    mx, mn = emas.max(axis=1), emas.min(axis=1)
+    df["EMA_spread"] = (mx - mn) / mn.where(mn > 0) * 100
+    df["Price_dev"] = (df["Close"] - df["EMA_avg"]).abs() / df["EMA_avg"].where(df["EMA_avg"] > 0) * 100
+    df["GG"] = (df["EMA_spread"] <= ema_convergence_pct) & (df["Price_dev"] <= price_to_ema_pct)
+
+    latest = df.iloc[-1]
+    gg_formed_now = bool(latest["GG"])
+    latest_spread = None if pd.isna(latest["EMA_spread"]) else float(latest["EMA_spread"])
+    latest_dev = None if pd.isna(latest["Price_dev"]) else float(latest["Price_dev"])
+
+    event_formed, event_pct, zone_date, move_pct = False, None, None, None
+
+    window = df.iloc[-gg_lookback_bars:-1] if gg_lookback_bars > 1 else df.iloc[0:0]
+    prior = window[window["GG"]]
+    if not prior.empty:
+        last_gg_idx = prior.index[-1]
+        zone_price = df.loc[last_gg_idx, "EMA_avg"]
+        pct_move = (latest["Close"] - zone_price) / zone_price * 100
+        move_pct = round(float(pct_move), 2)
+        achieved = [lvl for lvl in breakout_levels if pct_move >= lvl]
+        if achieved:
+            event_formed, event_pct, zone_date = True, max(achieved), last_gg_idx
+
+    trend = compute_trend(latest)
+    price_action, price_action_pct = compute_price_action(df)
+    latest_volume, avg_volume, volume_spike = compute_volume_metrics(
+        df, spike_multiplier=volume_spike_multiplier
     )
-elif df is not None and df.empty:
-    st.warning("The scan returned no results. The exchange may have blocked the request, so try again shortly or use your own stock list.")
-else:
-    st.info("Pick a market group and index in the sidebar, choose up to three timeframes, then select **Run scan**.")
+    avg_turnover = (avg_volume * float(latest["Close"])) if avg_volume else None
 
-st.markdown(
-    '<div class="foot">Disclaimer: this tool performs purely mechanical EMA calculations on public '
-    "market data. It is provided for educational and informational purposes only and does not "
-    "constitute investment advice under SEBI regulations. Trading and investing in securities "
-    "markets carries risk of loss; past patterns do not guarantee future results. Consult a "
-    "SEBI-registered adviser before making investment decisions.</div>",
-    unsafe_allow_html=True,
-)
+    return {
+        "Symbol": display_symbol(ticker),
+        "Ticker": ticker,
+        "Last Close": round(float(latest["Close"]), 2),
+        "EMA20": round(float(latest["EMA20"]), 2),
+        "EMA50": round(float(latest["EMA50"]), 2),
+        "EMA100": round(float(latest["EMA100"]), 2),
+        "EMA200": round(float(latest["EMA200"]), 2),
+        "EMA Spread %": round(latest_spread, 2) if latest_spread is not None else None,
+        "Price Dev %": round(latest_dev, 2) if latest_dev is not None else None,
+        "Golden Gate": "Formed" if gg_formed_now else "Not Formed",
+        "EMA Breakout Signal": f"Formed (+{event_pct}% breakout)" if event_formed else "Not Formed",
+        "Move from last GG zone %": move_pct if move_pct is not None else "-",
+        "GG Zone Date": zone_date.strftime("%Y-%m-%d %H:%M") if zone_date is not None else "-",
+        "Trend": trend,
+        "Price Action": f"{price_action} ({price_action_pct:+.2f}%)" if price_action_pct is not None else price_action,
+        "Volume": round(latest_volume) if latest_volume is not None else "-",
+        "Avg Volume": round(avg_volume) if avg_volume is not None else "-",
+        "Volume Spike": "Yes" if volume_spike else "No",
+        "_avg_turnover": avg_turnover,
+    }
+
+
+def _safe_analyze(ticker, tf_label, params):
+    interval, period, resample_to = TIMEFRAME_MAP[tf_label]
+    try:
+        return analyze_stock(ticker, interval, period, resample_to=resample_to, **params)
+    except Exception:
+        return None
+
+
+def add_liquidity_ranking(df):
+    """High/Medium/Low liquidity, ranked relative to the other symbols in this scan."""
+    if df.empty or "_avg_turnover" not in df.columns:
+        df["Liquidity"] = "-"
+        return df
+
+    valid = df["_avg_turnover"].notna()
+    if valid.sum() < 3:
+        df["Liquidity"] = df["_avg_turnover"].apply(lambda v: "-" if pd.isna(v) else "N/A (too few to rank)")
+        return df.drop(columns=["_avg_turnover"])
+
+    ranks = df.loc[valid, "_avg_turnover"].rank(pct=True)
+    df.loc[valid, "Liquidity"] = ranks.apply(lambda p: "High" if p >= 0.67 else "Medium" if p >= 0.33 else "Low")
+    df.loc[~valid, "Liquidity"] = "-"
+    return df.drop(columns=["_avg_turnover"])
+
+
+def _resolve_tickers(index_name, custom_tickers, exchange, custom_suffix):
+    if custom_tickers:
+        return build_custom_tickers(custom_tickers, custom_suffix)
+    return get_tickers_for_market(index_name, exchange=exchange)
+
+
+def run_scan(index_name, timeframe_label, progress_callback=None, custom_tickers=None,
+             ema_convergence_pct=EMA_CONVERGENCE_PCT, price_to_ema_pct=PRICE_TO_EMA_PCT,
+             breakout_levels=BREAKOUT_LEVELS, gg_lookback_bars=GG_LOOKBACK_BARS,
+             volume_spike_multiplier=VOLUME_SPIKE_MULTIPLIER,
+             exchange="NSE", custom_suffix=".NS", max_workers=MAX_WORKERS):
+    """Single-timeframe scan, downloaded in parallel.
+    progress_callback(i, total, symbol, result_or_None) runs on the calling thread."""
+    tickers = _resolve_tickers(index_name, custom_tickers, exchange, custom_suffix)
+    params = dict(
+        ema_convergence_pct=ema_convergence_pct, price_to_ema_pct=price_to_ema_pct,
+        breakout_levels=breakout_levels, gg_lookback_bars=gg_lookback_bars,
+        volume_spike_multiplier=volume_spike_multiplier,
+    )
+
+    results, done = [], 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_safe_analyze, t, timeframe_label, params): t for t in tickers}
+        for fut in as_completed(futures):
+            res = fut.result()
+            done += 1
+            if res:
+                results.append(res)
+            if progress_callback:
+                progress_callback(done, len(tickers), display_symbol(futures[fut]), res)
+
+    if not results:
+        return pd.DataFrame()
+
+    out_df = add_liquidity_ranking(pd.DataFrame(results))
+    return out_df.sort_values(by=["EMA Spread %"], ascending=True).reset_index(drop=True)
+
+
+def run_multi_timeframe_scan(index_name, timeframe_labels, progress_callback=None, custom_tickers=None,
+                             ema_convergence_pct=EMA_CONVERGENCE_PCT, price_to_ema_pct=PRICE_TO_EMA_PCT,
+                             breakout_levels=BREAKOUT_LEVELS, gg_lookback_bars=GG_LOOKBACK_BARS,
+                             volume_spike_multiplier=VOLUME_SPIKE_MULTIPLIER,
+                             exchange="NSE", custom_suffix=".NS", max_workers=MAX_WORKERS):
+    """Scans every stock on 1-3 timeframes; one row per stock, timeframes side by side."""
+    if not timeframe_labels:
+        raise ValueError("Select at least one timeframe.")
+
+    tickers = _resolve_tickers(index_name, custom_tickers, exchange, custom_suffix)
+    params = dict(
+        ema_convergence_pct=ema_convergence_pct, price_to_ema_pct=price_to_ema_pct,
+        breakout_levels=breakout_levels, gg_lookback_bars=gg_lookback_bars,
+        volume_spike_multiplier=volume_spike_multiplier,
+    )
+
+    total, done = len(tickers) * len(timeframe_labels), 0
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(_safe_analyze, t, tf, params): (t, tf)
+            for t in tickers for tf in timeframe_labels
+        }
+        for fut in as_completed(futures):
+            t, tf = futures[fut]
+            results[(t, tf)] = fut.result()
+            done += 1
+            if progress_callback:
+                progress_callback(done, total, display_symbol(t), tf)
+
+    rows = []
+    for ticker in tickers:
+        row, any_data = {"Symbol": display_symbol(ticker), "Ticker": ticker}, False
+        for tf in timeframe_labels:
+            res = results.get((ticker, tf))
+            if res:
+                any_data = True
+                row[f"Last Close ({tf})"] = res["Last Close"]
+                row[f"EMA Spread % ({tf})"] = res["EMA Spread %"]
+                row[f"Golden Gate ({tf})"] = res["Golden Gate"]
+                row[f"EMA Breakout Signal ({tf})"] = res["EMA Breakout Signal"]
+                row[f"Trend ({tf})"] = res["Trend"]
+                row[f"Price Action ({tf})"] = res["Price Action"]
+                row[f"Volume Spike ({tf})"] = res["Volume Spike"]
+            else:
+                row[f"Last Close ({tf})"] = None
+                row[f"EMA Spread % ({tf})"] = None
+                for k in ("Golden Gate", "EMA Breakout Signal", "Trend", "Price Action", "Volume Spike"):
+                    row[f"{k} ({tf})"] = "No Data"
+        if any_data:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out_df = pd.DataFrame(rows)
+    gg_cols = [c for c in out_df.columns if c.startswith("Golden Gate (")]
+    ev_cols = [c for c in out_df.columns if c.startswith("EMA Breakout Signal (")]
+
+    out_df["Golden Gate - Any TF"] = out_df[gg_cols].apply(
+        lambda r: "Formed" if any(v == "Formed" for v in r) else "Not Formed", axis=1)
+    out_df["EMA Breakout Signal - Any TF"] = out_df[ev_cols].apply(
+        lambda r: "Formed" if any(str(v).startswith("Formed") for v in r) else "Not Formed", axis=1)
+
+    # "Formed" sorts before "Not Formed" alphabetically, so ascending puts matches first
+    out_df = out_df.sort_values(by=["Golden Gate - Any TF", "EMA Breakout Signal - Any TF"],
+                                ascending=[True, True])
+    return out_df.reset_index(drop=True)

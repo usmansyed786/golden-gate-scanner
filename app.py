@@ -168,7 +168,9 @@ with st.sidebar:
         if uploaded is not None:
             try:
                 lines = uploaded.getvalue().decode("utf-8-sig").splitlines()
-                start = next((i for i, ln in enumerate(lines) if ln.startswith(("Ticker,", "Symbol,"))), 0)
+                start = next(
+                    (i for i, ln in enumerate(lines)
+                     if ln.replace('"', "").strip().startswith(("Ticker,", "Symbol,"))), 0)
                 up_df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
                 col = next((c for c in ("Symbol", "Ticker") if c in up_df.columns), up_df.columns[0])
                 if "Asset Class" in up_df.columns:
